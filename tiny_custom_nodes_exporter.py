@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Tiny Custom Nodes Exporter",
     "author": "MoxTools",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 0, 0),
     "location": "Shader Editor > Context Menu (Right Click)",
-    "description": "Exports shader node groups as standalone, ready-to-install Blender add-ons including texture pointers.",
+    "description": "Exports shader node groups as standalone, ready-to-install Blender add-ons including texture pointers and ColorRamps.",
     "warning": "",
     "doc_url": "https://github.com/MoxTools/blender-tiny-custom-nodes-exporter",
     "tracker_url": "https://github.com/MoxTools/blender-tiny-custom-nodes-exporter/issues",
@@ -14,7 +14,6 @@ bl_info = {
 import bpy
 import os
 
-# --- GLOBAL BUFFER FOR GENERATED CODE ---
 def setup_temporary_properties():
     try:
         bpy.types.WindowManager.exported_addon_code_buffer = bpy.props.StringProperty(options={'HIDDEN'})
@@ -28,7 +27,6 @@ def clear_temporary_properties():
         pass
 
 
-# 1. File Save Dialog
 class WM_OT_ExportAddonFileDialog(bpy.types.Operator):
     bl_idname = "wm.export_addon_file_dialog"
     bl_label = "Save Custom Node As..."
@@ -64,7 +62,6 @@ class WM_OT_ExportAddonFileDialog(bpy.types.Operator):
         return {'FINISHED'}
 
 
-# 2. Main Operator (Generates code from Node Group)
 class NODE_OT_ExportGroupAsAddon(bpy.types.Operator):
     bl_idname = "node.export_group_as_addon"
     bl_label = "Export as Custom Node"
@@ -84,9 +81,7 @@ class NODE_OT_ExportGroupAsAddon(bpy.types.Operator):
         source_tree = active_node.node_tree
         target_group_name = source_tree.name
         
-        # Check if the node group contains image textures
         has_images = any(node.type == 'TEX_IMAGE' for node in source_tree.nodes)
-        
         clean_name = "".join([c for c in target_group_name if c.isalnum() or c == '_'])
 
         # --- CODE GENERATION ---
@@ -100,7 +95,11 @@ class NODE_OT_ExportGroupAsAddon(bpy.types.Operator):
             socket_type = repr(item.socket_type)
             tree_code += f"        sock = group.interface.new_socket(name='{item.name}', in_out='{item.in_out}', socket_type={socket_type})\n"
             if hasattr(item, "default_value"):
-                tree_code += f"        try: sock.default_value = {repr(item.default_value)}\n        except: pass\n"
+                val = item.default_value
+                if hasattr(val, "__len__"):
+                    tree_code += f"        try: sock.default_value = [{','.join(map(str, val))}]\n        except: pass\n"
+                else:
+                    tree_code += f"        try: sock.default_value = {repr(val)}\n        except: pass\n"
             if item.in_out == 'INPUT':
                 if hasattr(item, "min_value") and item.min_value is not None:
                     tree_code += f"        try: sock.min_value = {item.min_value}\n        except: pass\n"
@@ -129,6 +128,24 @@ class NODE_OT_ExportGroupAsAddon(bpy.types.Operator):
             if hasattr(node, "shrink") and node.bl_idname == 'NodeFrame':
                 node_line += f"        {safe_node_var}.shrink = {node.shrink}\n"
                 
+            # --- SPEZIALFALL: COLORRAMP (ValToRGB) ---
+            if node.bl_idname == 'ShaderNodeValToRGB':
+                node_line += f"        # ColorRamp Setup\n"
+                node_line += f"        ramp_{safe_node_var} = {safe_node_var}.color_ramp\n"
+                node_line += f"        ramp_{safe_node_var}.interpolation = '{node.color_ramp.interpolation}'\n"
+                # Bestehende Standard-Elemente löschen (Blender erstellt immer 2)
+                node_line += f"        while len(ramp_{safe_node_var}.elements) > 1:\n"
+                node_line += f"            ramp_{safe_node_var}.elements.remove(ramp_{safe_node_var}.elements[-1])\n"
+                
+                for idx, element in enumerate(node.color_ramp.elements):
+                    color_list = [element.color[0], element.color[1], element.color[2], element.color[3]]
+                    if idx == 0:
+                        node_line += f"        ramp_{safe_node_var}.elements[0].position = {element.position}\n"
+                        node_line += f"        ramp_{safe_node_var}.elements[0].color = {color_list}\n"
+                    else:
+                        node_line += f"        elem_{idx} = ramp_{safe_node_var}.elements.new({element.position})\n"
+                        node_line += f"        elem_{idx}.color = {color_list}\n"
+
             excluded_props = {'name', 'type', 'location', 'width', 'height', 'select', 'hide', 'inputs', 'outputs', 'internal_links', 'parent', 'draw_buttons', 'draw_buttons_ext', 'rna_type', 'bl_idname', 'label', 'color', 'use_custom_color', 'show_options', 'show_texture', 'show_preview'}
             for prop in node.rna_type.properties:
                 p_id = prop.identifier
@@ -141,10 +158,12 @@ class NODE_OT_ExportGroupAsAddon(bpy.types.Operator):
             for i, inp in enumerate(node.inputs):
                 if not inp.is_linked and hasattr(inp, "default_value"):
                     val = inp.default_value
-                    if type(val) in (float, int, str, bool):
+                    # Fix für Colors / Vektoren / Listen in Inputs
+                    if hasattr(val, "__len__") and not isinstance(val, str):
+                        val_list = list(val)
+                        node_line += f"        try: {safe_node_var}.inputs[{i}].default_value = {val_list}\n        except: pass\n"
+                    elif type(val) in (float, int, str, bool):
                         node_line += f"        try: {safe_node_var}.inputs[{i}].default_value = {repr(val)}\n        except: pass\n"
-                    elif hasattr(val, "foreach_get"):
-                        node_line += f"        try: {safe_node_var}.inputs[{i}].default_value = [{','.join(map(str, val))}]\n        except: pass\n"
             
             node_line += f"        created_nodes[{repr(node.name)}] = {safe_node_var}\n"
             tree_code += node_line
@@ -165,15 +184,13 @@ class NODE_OT_ExportGroupAsAddon(bpy.types.Operator):
                 tree_code += f"        try: group.links.new(created_nodes[{repr(from_node_name)}].outputs[{from_idx}], created_nodes[{repr(to_node_name)}].inputs[{to_idx}])\n        except: pass\n"
             except: pass
 
-        # Control UI drawing logic dynamically
         if has_images:
             draw_buttons_code = '        layout.template_ID(self, "image_pointer", open="image.open")'
             pointer_property_code = '    image_pointer: bpy.props.PointerProperty(type=bpy.types.Image, name="Texture", update=lambda self, context: self.update_image(context))'
         else:
             draw_buttons_code = '        pass'
-            pointer_property_code = '    pass'
+            pointer_property_code = ''
 
-        # --- CODE TEMPLATE FOR GENERATED ADDON ---
         addon_template = f'''bl_info = {{
     "name": "Custom Node - {target_group_name}",
     "author": "MoxTools Generator",
@@ -196,7 +213,6 @@ class Generated_{clean_name}_Node(ShaderNodeCustomGroup):
 
     def update_image(self, context):
         if hasattr(self, "image_pointer") and self.node_tree:
-            # Safety check: does the assigned image still exist in Blender?
             img = self.image_pointer if (self.image_pointer and self.image_pointer.name in bpy.data.images) else None
             for node in self.node_tree.nodes:
                 if node.type == 'TEX_IMAGE':
@@ -219,7 +235,6 @@ class Generated_{clean_name}_Node(ShaderNodeCustomGroup):
             except: pass
 
 
-# --- COLLISION-FREE SHARED MENU SYSTEM ---
 class NODE_MT_custom_nodes_submenu(bpy.types.Menu):
     bl_label = "Custom Nodes"
     bl_idname = "NODE_MT_custom_nodes_submenu"
@@ -261,7 +276,6 @@ def unregister():
 if __name__ == "__main__":
     register()
 '''
-        # --- DETERMINE DEFAULT FILE PATH ---
         filename = f"customnode_{clean_name.lower()}.py"
         if bpy.data.filepath:
             base_dir = os.path.dirname(bpy.data.filepath)
@@ -269,7 +283,6 @@ if __name__ == "__main__":
             base_dir = os.path.join(os.path.expanduser('~'), 'Documents')
             
         absolute_default_filepath = os.path.join(base_dir, filename)
-
         context.window_manager.exported_addon_code_buffer = addon_template
 
         bpy.ops.wm.export_addon_file_dialog(
@@ -279,7 +292,6 @@ if __name__ == "__main__":
         return {'FINISHED'}
 
 
-# 3. Context Menu Entry
 def draw_context_menu_export(self, context):
     active_node = context.active_node
     if active_node and hasattr(active_node, "node_tree") and active_node.node_tree:
@@ -288,7 +300,6 @@ def draw_context_menu_export(self, context):
         layout.operator(NODE_OT_ExportGroupAsAddon.bl_idname, text=f"Export '{active_node.node_tree.name}' as Custom Node...", icon='SCRIPT')
 
 
-# --- REGISTRATION ---
 classes = (
     WM_OT_ExportAddonFileDialog,
     NODE_OT_ExportGroupAsAddon,
